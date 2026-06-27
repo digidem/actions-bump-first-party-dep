@@ -1,0 +1,88 @@
+name: bump-first-party-dep
+
+# Reusable receiver: a first-party publish dispatches here; bump that package to
+# @latest wherever it appears (direct -> rewrite the exact pin; transitive ->
+# refresh the lockfile), in / and /backend. Lockfile-only; CI does the real
+# install. Updates a single rolling PR: new releases that land before it merges
+# add commits to the same PR rather than opening a new one each time.
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: "Package to bump (e.g. @comapeo/core)"
+        required: true
+        type: string
+    secrets:
+      PR_BOT_PRIVATE_KEY:
+        required: true
+
+# Serialize runs so concurrent dispatches don't race the rolling branch.
+concurrency:
+  group: first-party-bump
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BRANCH: deps/first-party-updates
+      PACKAGE: ${{ inputs.package }}
+    steps:
+      - uses: actions/create-github-app-token@v3
+        id: token
+        with:
+          app-id: ${{ vars.PR_BOT_APP_ID }}
+          private-key: ${{ secrets.PR_BOT_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v7
+        with:
+          token: ${{ steps.token.outputs.token }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+
+      - name: Bump and open/update rolling PR
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          APP_SLUG: ${{ steps.token.outputs.app-slug }}
+          BOT_USER_ID: ${{ vars.PR_BOT_USER_ID }}
+        run: |
+          set -euo pipefail
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${BOT_USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
+
+          # Accumulate onto the rolling branch if its PR is still open; otherwise
+          # start fresh from the default branch (the previous PR has merged/closed).
+          if [ "$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')" -gt 0 ]; then
+            git fetch origin "$BRANCH":"$BRANCH"
+            git switch "$BRANCH"
+          else
+            git switch -c "$BRANCH"
+          fi
+
+          for dir in . backend; do
+            [ -f "$dir/package.json" ] || continue
+            ( cd "$dir"
+              if npm ls "$PACKAGE" --depth=0 --package-lock-only >/dev/null 2>&1; then
+                npm install "$PACKAGE@latest" --save-exact --package-lock-only
+              elif npm ls "$PACKAGE" --package-lock-only >/dev/null 2>&1; then
+                npm update "$PACKAGE" --package-lock-only
+              fi
+            )
+          done
+
+          if git diff --quiet; then echo "${PACKAGE} already current; nothing to bump."; exit 0; fi
+          git commit -am "chore(deps): bump ${PACKAGE}"
+          git push --force-with-lease origin "$BRANCH"
+
+          if [ "$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')" -eq 0 ]; then
+            gh pr create --head "$BRANCH" \
+              --base "$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name)" \
+              --title "chore(deps): bump first-party packages" \
+              --body "Automated bumps of first-party packages, triggered by their releases. New releases are added to this PR until it merges."
+          fi
