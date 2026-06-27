@@ -1,10 +1,13 @@
 name: bump-first-party-dep
 
 # Reusable receiver: a first-party publish dispatches here; bump that package to
-# @latest wherever it appears (direct -> rewrite the exact pin; transitive ->
-# refresh the lockfile), in / and /backend. Lockfile-only; CI does the real
-# install. Updates a single rolling PR: new releases that land before it merges
-# add commits to the same PR rather than opening a new one each time.
+# @latest in ONE directory (direct dep -> rewrite the exact pin; transitive ->
+# refresh the lockfile). Lockfile-only; CI does the real install. Updates a single
+# rolling PR — releases that land before it merges add commits to the same PR.
+#
+# Operates on a single `path` (default repo root). A repo with more than one
+# package tree (e.g. a root + an embedded backend) calls this once per directory
+# via a matrix; the rolling PR + concurrency group make those land in one PR.
 on:
   workflow_call:
     inputs:
@@ -12,11 +15,22 @@ on:
         description: "Package to bump (e.g. @comapeo/core)"
         required: true
         type: string
+      path:
+        description: "Directory with the package.json + lockfile to update (default repo root)"
+        required: false
+        type: string
+        default: "."
+      node-version-file:
+        description: "File to read the Node version from for tooling"
+        required: false
+        type: string
+        default: "package.json"
     secrets:
       PR_BOT_PRIVATE_KEY:
         required: true
 
-# Serialize runs so concurrent dispatches don't race the rolling branch.
+# Serialize runs so concurrent dispatches / matrix legs don't race the rolling
+# branch, and so per-directory legs accumulate into one PR.
 concurrency:
   group: first-party-bump
   cancel-in-progress: false
@@ -31,6 +45,7 @@ jobs:
     env:
       BRANCH: deps/first-party-updates
       PACKAGE: ${{ inputs.package }}
+      WORKDIR: ${{ inputs.path }}
     steps:
       - uses: actions/create-github-app-token@v3
         id: token
@@ -44,7 +59,7 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version-file: package.json
+          node-version-file: ${{ inputs.node-version-file }}
 
       - name: Bump and open/update rolling PR
         env:
@@ -53,32 +68,38 @@ jobs:
           BOT_USER_ID: ${{ vars.PR_BOT_USER_ID }}
         run: |
           set -euo pipefail
+          test -f "$WORKDIR/package.json" || { echo "no package.json in '$WORKDIR'; skipping."; exit 0; }
           git config user.name "${APP_SLUG}[bot]"
           git config user.email "${BOT_USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
 
           # Accumulate onto the rolling branch if its PR is still open; otherwise
-          # start fresh from the default branch (the previous PR has merged/closed).
+          # start fresh from the default branch (previous PR merged/closed).
           if [ "$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')" -gt 0 ]; then
+            had_pr=1
             git fetch origin "$BRANCH":"$BRANCH"
             git switch "$BRANCH"
           else
+            had_pr=0
             git switch -c "$BRANCH"
           fi
 
-          for dir in . backend; do
-            [ -f "$dir/package.json" ] || continue
-            ( cd "$dir"
-              if npm ls "$PACKAGE" --depth=0 --package-lock-only >/dev/null 2>&1; then
-                npm install "$PACKAGE@latest" --save-exact --package-lock-only
-              elif npm ls "$PACKAGE" --package-lock-only >/dev/null 2>&1; then
-                npm update "$PACKAGE" --package-lock-only
-              fi
-            )
-          done
+          ( cd "$WORKDIR"
+            if npm ls "$PACKAGE" --depth=0 --package-lock-only >/dev/null 2>&1; then
+              npm install "$PACKAGE@latest" --save-exact --package-lock-only
+            elif npm ls "$PACKAGE" --package-lock-only >/dev/null 2>&1; then
+              npm update "$PACKAGE" --package-lock-only
+            fi
+          )
 
-          if git diff --quiet; then echo "${PACKAGE} already current; nothing to bump."; exit 0; fi
-          git commit -am "chore(deps): bump ${PACKAGE}"
-          git push --force-with-lease origin "$BRANCH"
+          if git diff --quiet; then echo "${PACKAGE} already current in '${WORKDIR}'; nothing to bump."; exit 0; fi
+          msg="chore(deps): bump ${PACKAGE}"
+          [ "$WORKDIR" = "." ] || msg="${msg} (${WORKDIR})"
+          git commit -am "$msg"
+          if [ "$had_pr" = 1 ]; then
+            git push --force-with-lease origin "$BRANCH"
+          else
+            git push --force origin "$BRANCH"   # overwrite any stale branch from a merged PR
+          fi
 
           if [ "$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')" -eq 0 ]; then
             gh pr create --head "$BRANCH" \
