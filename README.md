@@ -13,7 +13,7 @@ does the real install.
 | `path` | no | `.` | Directory containing the `package.json` + lockfile to update |
 | `node-version-file` | no | `package.json` | File to read the Node version from (tooling) |
 
-Secret: `PR_BOT_PRIVATE_KEY`. Also needs variables `PR_BOT_APP_ID`,
+Secret: `PR_BOT_PRIVATE_KEY`. Also needs variables `PR_BOT_CLIENT_ID`,
 `PR_BOT_USER_ID` and the PR bot app installed with Contents + Pull-requests write
 (so the bump PR triggers the repo's required checks — the default `GITHUB_TOKEN`
 would not).
